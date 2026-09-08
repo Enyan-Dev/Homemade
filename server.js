@@ -1,18 +1,36 @@
-// loading Express package installed
+// loading  packages and modules installed
 const express = require('express');
+const http = require('http');
+const {WebSocketServer} = require('ws');
 
-//initializing our server application
+//initializing our server application & defining port
 const app = express();
-
-// Defining port for server listening(locally)
 const PORT = 3000;
 
-//Setting up default route
+//Wrapping Express with standard HTTP server & attaching a webSocket server to the http server
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+//Defining default route
 app.get('/', (req, res) => {
     res.send('HOMEMADE Video Chat & Arcade is running!');
 });
 
-// Server start
-app.listen(PORT, () => {
-    console.log('Server running at http://localhost:${PORT}');
+// listen for incoming WebSocket connections
+wss.on('connection', (socket) => {
+    console.log('A new user connected via WebSocket!');
+   
+    // Listen for messages sent by this client
+    socket.on('message', (message) => {
+        console.log('Received:', message.toString());
+    });
+
+    //Handle user disconnect
+    socket.on('close', () => {
+        console.log('User disconnected.');
+    });
+});
+// Server start(using 'server.listen' )
+server.listen(PORT, () => {
+    console.log(`HOMEMADE server running at http://localhost:${PORT}`);
 });
