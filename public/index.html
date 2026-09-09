@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HOMEMADE Video Room</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #121212;
+            color: #ffffff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+        }
+        .video-container {
+            display: flex;
+            gap: 20px;
+            margin: 20px 0;
+        }
+        video {
+            width: 320px;
+            height: 240px;
+            background-color: #000;
+            border-radius: 8px;
+            border: 2px solid #333;
+        }
+        button {
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            cursor: pointer;
+            background-color: #25d366;
+            color: #000;
+            border: none;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        #log {
+            width: 100%;
+            max-width: 660px;
+            height: 180px;
+            background: #1e1e1e;
+            border-radius: 5px;
+            padding: 1rem;
+            overflow-y: auto;
+            font-family: monospace;
+            border: 1px solid #333;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>HOMEMADE Video Room</h1>
+    <button id="createBtn">Create New Room</button>
+
+    <div class="video-container">
+        <div>
+            <p>Local Stream (You)</p>
+            <video id="localVideo" autoplay playsinline muted></video>
+        </div>
+        <div>
+            <p>Remote Stream (Peer)</p>
+            <video id="remoteVideo" autoplay playsinline></video>
+        </div>
+    </div>
+
+    <h3>Activity Log:</h3>
+    <div id="log"></div>
+
+    <script>
+        const logDiv = document.getElementById('log');
+        const createBtn = document.getElementById('createBtn');
+        const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
+
+        let localStream = null;
+        let peerConnection = null;
+        let ws = null;
+
+        // Free public STUN servers for NAT traversal
+        const rtcConfig = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+
+        function log(msg) {
+            logDiv.innerHTML += `<div>> ${msg}</div>`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const roomId = urlParams.get('room');
+
+        createBtn.addEventListener('click', async () => {
+            const res = await fetch('/create-room');
+            const data = await res.json();
+            if (data.success) {
+                window.location.href = `/?room=${data.roomId}`;
+            }
+        });
+
+        async function init() {
+            if (!roomId) {
+                log('Click "Create New Room" to start a room.');
+                return;
+            }
+
+            try {
+                // 1. Request webcam and microphone access
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                localVideo.srcObject = localStream;
+                log('Camera & Microphone accessed.');
+
+                // 2. Connect to signaling WebSocket
+                ws = new WebSocket(`ws://${window.location.host}`);
+
+                ws.onopen = () => {
+                    log(`Connected to WebSocket server. Joining room: ${roomId}`);
+                    ws.send(JSON.stringify({ type: 'join-room', roomId: roomId }));
+                };
+
+                ws.onmessage = async (event) => {
+                    const message = JSON.parse(event.data);
+
+                    if (message.type === 'joined') {
+                        log('Successfully joined room.');
+                        createPeerConnection();
+                        
+                        // Create and send WebRTC offer to initiate connection
+                        const offer = await peerConnection.createOffer();
+                        await peerConnection.setLocalDescription(offer);
+                        sendSignal({ sdp: peerConnection.localDescription });
+                    }
+
+                    if (message.type === 'signal') {
+                        handleIncomingSignal(message.signalData);
+                    }
+                };
+
+            } catch (err) {
+                log(`Media Error: ${err.message}`);
+            }
+        }
+
+        function createPeerConnection() {
+            if (peerConnection) return;
+
+            peerConnection = new RTCPeerConnection(rtcConfig);
+
+            // Add local stream tracks to WebRTC connection
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+
+            // Handle incoming remote media tracks
+            peerConnection.ontrack = (event) => {
+                log('Received remote track! Playing stream...');
+                remoteVideo.srcObject = event.streams[0];
+            };
+
+            // Send local network ICE candidates to signaling server
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    sendSignal({ candidate: event.candidate });
+                }
+            };
+        }
+
+        async function handleIncomingSignal(signal) {
+            if (!peerConnection) {
+                createPeerConnection();
+            }
+
+            // Handle SDP offer/answer exchange
+            if (signal.sdp) {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+
+                if (signal.sdp.type === 'offer') {
+                    const answer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(answer);
+                    sendSignal({ sdp: peerConnection.localDescription });
+                }
+            } 
+            // Handle ICE Candidate registration
+            else if (signal.candidate) {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
+            }
+        }
+
+        function sendSignal(signalData) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'signal',
+                    signalData: signalData
+                }));
+            }
+        }
+
+        init();
+    </script>
+</body>
+</html>

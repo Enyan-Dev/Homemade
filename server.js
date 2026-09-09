@@ -7,6 +7,8 @@ const crypto = require('crypto'); //Random ID generator
 //initializing our server application & defining port
 const app = express();
 const PORT = 3000;
+// Serve static files from the "public" folder
+app.use(express.static('public'));
 
 //store active rooms in memory: Key = roomId, Value = Room Object
 const rooms = new Map();
@@ -108,6 +110,23 @@ wss.on('connection', (socket) => {
                 console.log(`Client joined room: ${roomId} (Total users: ${room.users.length})`);
                 //confirm join to the user
                 socket.send(JSON.stringify({type: 'joined', roomId: roomId}));
+            }
+
+            //-Handle 'signal' message (Relay WebRTC offers, answers, & ICE candidates)
+            if (data.type === 'signal') {
+                if (!currentRoomId || !rooms.has(currentRoomId)) return;
+                const room = rooms.get(currentRoomId);
+
+                //Broadcast signal to Every user in this room Except the sender
+                room.users.forEach((clientSocket) => {
+                    if (clientSocket !== socket && clientSocket.readyState === 1) {
+                        clientSocket.send(JSON.stringify({
+                            type: 'signal',
+                            sender: 'peer',
+                            signalData: data.signalData
+                        }));
+                    }
+                });
             }
         }catch (error) {
             console.error('Invalid JSON received:',error.message);
