@@ -19,7 +19,7 @@ setInterval(() => {
     // Iterate through every active room in the Map
     rooms.forEach((room, roomId) => {
         const isExpired = (now - room.createdAt) > ROOM_EXPIRATION_TIME;
-        const isEmpty = room.users.lenght === 0;
+        const isEmpty = room.users.length === 0;
 
         //Delete room if older than 15 mins AND no active users remain
         if (isExpired && isEmpty) {
@@ -68,7 +68,7 @@ app.get('/room/:roomId', (req, res) => {
         success: true,
         roomId: roomId,
         createdAt: room.createdAt,
-        activeUsers: room.users.lenght
+        activeUsers: room.users.length
     });
 });
 
@@ -81,14 +81,49 @@ app.get('/', (req, res) => {
 wss.on('connection', (socket) => {
     console.log('A new user connected via WebSocket!');
    
-    // Listen for messages sent by this client
-    socket.on('message', (message) => {
-        console.log('Received:', message.toString());
-    });
+   //Track which room this specific socket belongs to
+   let currentRoomId = null;
+   //listen for incoming message from this client
+   socket.on('message', (rawData) => {
+        try {
+            //convert incoming JSON string into JS Object
+            const data = JSON.parse(rawData);
+            //Handle 'join-room' message
+            if(data.type === 'join-room'){
+                const {roomId} = data;
+                //checking if room exist in the map
+                if(!rooms.has(roomId)) {
+                    socket.send(JSON.stringify({type: 'error', message: 'Room not found or expired!'}));
+                    return;
+                }
+                //Store roomId on this connection context
+                currentRoomId = roomId;
+                const room = rooms.get(roomId);
+                //-doublecheck that room.users exists before push
+                if(!room.users) {
+                    room.users = []
+                }
+                //add this user's socket to the room's user array
+                room.users.push(socket);
+                console.log(`Client joined room: ${roomId} (Total users: ${room.users.length})`);
+                //confirm join to the user
+                socket.send(JSON.stringify({type: 'joined', roomId: roomId}));
+            }
+        }catch (error) {
+            console.error('Invalid JSON received:',error.message);
+        }
+   });
 
-    //Handle user disconnect
+   //Handle user disconnect
     socket.on('close', () => {
         console.log('User disconnected.');
+
+        //if user was in a room, remove their socket from that room
+        if (currentRoomId && rooms.has(currentRoomId)) {
+            const room = rooms.get(currentRoomId);
+            room.users = room.users.filter(userSocket => userSocket !== socket);
+            console.log(`Room ${currentRoomId} now has ${room.users.length} active users.`);
+        }
     });
 });
 // Server start(using 'server.listen' )
