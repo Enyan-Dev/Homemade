@@ -1,29 +1,25 @@
-// loading  packages and modules installed
 const express = require('express');
 const http = require('http');
-const {WebSocketServer} = require('ws');
-const crypto = require('crypto'); //Random ID generator
+const { WebSocketServer } = require('ws');
+const crypto = require('crypto');
 
-//initializing our server application & defining port
 const app = express();
 const PORT = 3000;
-// Serve static files from the "public" folder
+
+// Serve static assets from the public directory
 app.use(express.static('public'));
 
-//store active rooms in memory: Key = roomId, Value = Room Object
+// In-memory store for active rooms
 const rooms = new Map();
+const ROOM_EXPIRATION_TIME = 15 * 60 * 1000; // 15 Minutes
 
-//ROOM CLEANUP
-const ROOM_EXPIRATION_TIME = 15 * 60 * 1000; //15 mins in milliseconds (15 * 60secs * 1000ms)
-//Run cleanup every 1 minute (60,000 ms)
+// Garbage collection for abandoned/expired rooms
 setInterval(() => {
     const now = Date.now();
-    // Iterate through every active room in the Map
     rooms.forEach((room, roomId) => {
         const isExpired = (now - room.createdAt) > ROOM_EXPIRATION_TIME;
         const isEmpty = room.users.length === 0;
 
-        //Delete room if older than 15 mins AND no active users remain
         if (isExpired && isEmpty) {
             rooms.delete(roomId);
             console.log(`Cleaned up expired room: ${roomId}`);
@@ -31,20 +27,73 @@ setInterval(() => {
     });
 }, 60000);
 
-//Wrapping Express with standard HTTP server & attaching a webSocket server to the http server
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-//route to create a new unique HOMEMADE room link
+/**
+ * Broadcasts room state or specific event to all active clients in a given room.
+ * @param {string} roomId - Target room ID
+ * @param {object} payload - Message object to send
+ * @param {WebSocket|null} excludeSocket - Optional socket to exclude from broadcast
+ */
+function broadcastToRoom(roomId, payload, excludeSocket = null) {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    const message = JSON.stringify(payload);
+    room.users.forEach((user) => {
+        if (user.socket && user.socket !== excludeSocket && user.socket.readyState === 1) {
+            user.socket.send(message);
+        }
+    });
+}
+
+/**
+ * Generates public room state object (strips socket references).
+ * @param {object} room - Room object
+ * @returns {object} Public representation of room state
+ */
+function getPublicRoomState(roomId) {
+    const room = rooms.get(roomId);
+    if (!room) return null;
+
+    return {
+        roomId: roomId,
+        userCount: room.users.length,
+        gameState: room.gameState || 'IDLE',
+        users: room.users.map(u => ({
+            id: u.id,
+            username: u.username,
+            role: u.role,
+            status: u.status
+        }))
+    };
+}
+
+/**
+ * Triggers a full state sync to all active participants in a room.
+ * @param {string} roomId 
+ */
+function syncRoomStateToAll(roomId) {
+    const state = getPublicRoomState(roomId);
+    if (state) {
+        broadcastToRoom(roomId, {
+            type: 'room-state-update',
+            state: state
+        });
+    }
+}
+
+// --- HTTP ENDPOINTS ---
+
+// Room Creation Endpoint
 app.get('/create-room', (req, res) => {
-    //-Generate a a unique 36-character ID (e.g. "123e4567-e89b-12d3-a456-426614174000")
     const roomId = crypto.randomUUID();
-    //-Save the new room into the rooms Map
     rooms.set(roomId, {
         createdAt: Date.now(),
-        users: []
+        users: [],
+        gameState: 'IDLE' // Tracks arcade game lifecycle: 'IDLE' | 'PLAYING'
     });
-    //-Send room details back to the user
     res.json({
         success: true,
         roomId: roomId,
@@ -52,100 +101,247 @@ app.get('/create-room', (req, res) => {
     });
 });
 
-//Route to check if a specific room exists
+// Room Info/Validation Endpoint
 app.get('/room/:roomId', (req, res) => {
-    //-extract the roomId parameter from the URL path
     const roomId = req.params.roomId;
-    // room lookup in memory Map
     const room = rooms.get(roomId);
-    //-room verification(if room not in memory, send a 404 error)
-    if(!room) {
+    if (!room) {
         return res.status(404).json({
             success: false,
-            message: 'Room not found or has expired!'
+            message: 'Room not found or expired!'
         });
     }
-    //- If room exists, send back room details
     res.json({
         success: true,
         roomId: roomId,
         createdAt: room.createdAt,
-        activeUsers: room.users.length
+        activeUsers: room.users.length,
+        gameState: room.gameState || 'IDLE'
     });
 });
 
-//Defining default route
 app.get('/', (req, res) => {
     res.send('HOMEMADE Video Chat & Arcade is running!');
 });
 
-// listen for incoming WebSocket connections
+// --- REAL-TIME WEBSOCKET LOGIC ---
+
 wss.on('connection', (socket) => {
-    console.log('A new user connected via WebSocket!');
-   
-   //Track which room this specific socket belongs to
-   let currentRoomId = null;
-   //listen for incoming message from this client
-   socket.on('message', (rawData) => {
+    let currentRoomId = null;
+
+    socket.on('message', (rawData) => {
         try {
-            //convert incoming JSON string into JS Object
             const data = JSON.parse(rawData);
-            //Handle 'join-room' message
-            if(data.type === 'join-room'){
-                const {roomId} = data;
-                //checking if room exist in the map
-                if(!rooms.has(roomId)) {
-                    socket.send(JSON.stringify({type: 'error', message: 'Room not found or expired!'}));
+
+            // 1. JOIN ROOM & RECONNECTION HANDLER
+            if (data.type === 'join-room') {
+                const { roomId, username, userId } = data;
+
+                if (!rooms.has(roomId)) {
+                    socket.send(JSON.stringify({ type: 'error', message: 'Room not found or expired!' }));
                     return;
                 }
-                //Store roomId on this connection context
+
                 currentRoomId = roomId;
                 const room = rooms.get(roomId);
-                //-doublecheck that room.users exists before push
-                if(!room.users) {
-                    room.users = []
+
+                // Check if user is reconnecting during grace period
+                let existingUser = null;
+                if (userId) {
+                    existingUser = room.users.find(u => u.id === userId && u.status === 'RECONNECTING');
                 }
-                //add this user's socket to the room's user array
-                room.users.push(socket);
-                console.log(`Client joined room: ${roomId} (Total users: ${room.users.length})`);
-                //confirm join to the user
-                socket.send(JSON.stringify({type: 'joined', roomId: roomId}));
+
+                if (existingUser) {
+                    // Cancel grace period timeout
+                    if (existingUser.graceTimer) {
+                        clearTimeout(existingUser.graceTimer);
+                        existingUser.graceTimer = null;
+                    }
+
+                    existingUser.socket = socket;
+                    existingUser.status = 'ACTIVE';
+                    if (username) existingUser.username = username;
+
+                    // Send re-join confirmation to reconnecting user
+                    socket.send(JSON.stringify({
+                        type: 'joined',
+                        roomId: roomId,
+                        userId: existingUser.id,
+                        role: existingUser.role,
+                        userCount: room.users.length,
+                        gameState: room.gameState
+                    }));
+
+                    // Sync updated state to all peers
+                    syncRoomStateToAll(roomId);
+                    return;
+                }
+
+                // Enforce room participant limit (Max 8)
+                if (room.users.length >= 8) {
+                    socket.send(JSON.stringify({ type: 'error', message: 'Room is full! Maximum 8 participants.' }));
+                    socket.close();
+                    return;
+                }
+
+                // Assign primary hot seats before spectator pool
+                const activeRoles = room.users.map(u => u.role);
+                let assignedRole = 'SPECTATOR';
+                if (!activeRoles.includes('HOT_SEAT_P1')) {
+                    assignedRole = 'HOT_SEAT_P1';
+                } else if (!activeRoles.includes('HOT_SEAT_P2')) {
+                    assignedRole = 'HOT_SEAT_P2';
+                }
+
+                const userObj = {
+                    socket: socket,
+                    id: userId || crypto.randomUUID(),
+                    username: username || `Guest_${Math.floor(1000 + Math.random() * 9000)}`,
+                    role: assignedRole,
+                    status: 'ACTIVE',
+                    graceTimer: null
+                };
+
+                room.users.push(userObj);
+
+                // Send direct join confirmation to new participant
+                socket.send(JSON.stringify({
+                    type: 'joined',
+                    roomId: roomId,
+                    userId: userObj.id,
+                    role: userObj.role,
+                    userCount: room.users.length,
+                    gameState: room.gameState
+                }));
+
+                // Broadcast updated room state to EVERYONE in the room
+                syncRoomStateToAll(roomId);
             }
 
-            //-Handle 'signal' message (Relay WebRTC offers, answers, & ICE candidates)
+            // 2. WEBRTC SIGNALING RELAY
             if (data.type === 'signal') {
                 if (!currentRoomId || !rooms.has(currentRoomId)) return;
                 const room = rooms.get(currentRoomId);
 
-                //Broadcast signal to Every user in this room Except the sender
-                room.users.forEach((clientSocket) => {
-                    if (clientSocket !== socket && clientSocket.readyState === 1) {
-                        clientSocket.send(JSON.stringify({
+                room.users.forEach((client) => {
+                    // Don't echo back to the sender
+                    if (client.socket !== socket && client.socket.readyState === 1) {
+                        
+                        // If sender targeted a specific user ID, only deliver to that user
+                        if (data.targetId && client.id !== data.targetId) {
+                            return;
+                        }
+
+                        client.socket.send(JSON.stringify({
                             type: 'signal',
-                            sender: 'peer',
+                            senderId: data.senderId || socket.userId,
+                            targetId: data.targetId,
                             signalData: data.signalData
                         }));
                     }
                 });
             }
-        }catch (error) {
-            console.error('Invalid JSON received:',error.message);
-        }
-   });
 
-   //Handle user disconnect
-    socket.on('close', () => {
-        console.log('User disconnected.');
+            // 3. ARCADE GAME STATE & CONTROL RELAY
+            if (data.type === 'game-state') {
+                if (!currentRoomId || !rooms.has(currentRoomId)) return;
 
-        //if user was in a room, remove their socket from that room
-        if (currentRoomId && rooms.has(currentRoomId)) {
-            const room = rooms.get(currentRoomId);
-            room.users = room.users.filter(userSocket => userSocket !== socket);
-            console.log(`Room ${currentRoomId} now has ${room.users.length} active users.`);
+                broadcastToRoom(currentRoomId, {
+                    type: 'game-state',
+                    payload: data.payload
+                }, socket);
+            }
+
+            if (data.type === 'start-game') {
+                if (!currentRoomId || !rooms.has(currentRoomId)) return;
+                const room = rooms.get(currentRoomId);
+
+                // Check sender authority
+                const sender = room.users.find(u => u.socket === socket);
+                if (sender && (sender.role === 'HOT_SEAT_P1' || sender.role === 'HOT_SEAT_P2')) {
+                    room.gameState = 'PLAYING';
+                    syncRoomStateToAll(currentRoomId);
+                }
+            }
+
+            if (data.type === 'end-game') {
+                if (!currentRoomId || !rooms.has(currentRoomId)) return;
+                const room = rooms.get(currentRoomId);
+
+                room.gameState = 'IDLE';
+                syncRoomStateToAll(currentRoomId);
+            }
+
+        } catch (error) {
+            console.error('Invalid JSON received:', error.message);
         }
     });
+
+    // 4. DISCONNECT & FORFEIT MECHANICS
+    socket.on('close', () => {
+        if (!currentRoomId || !rooms.has(currentRoomId)) return;
+
+        const room = rooms.get(currentRoomId);
+        const userIndex = room.users.findIndex(u => u.socket === socket);
+
+        if (userIndex === -1) return;
+        const user = room.users[userIndex];
+
+        // Spectators drop immediately without grace period
+        if (user.role === 'SPECTATOR') {
+            room.users.splice(userIndex, 1);
+            syncRoomStateToAll(currentRoomId);
+            return;
+        }
+
+        // Hot Seat players trigger a 15-second grace period
+        user.status = 'RECONNECTING';
+
+        // Notify room of reconnecting status
+        broadcastToRoom(currentRoomId, {
+            type: 'player-reconnecting',
+            username: user.username,
+            role: user.role,
+            gracePeriodSec: 15
+        }, socket);
+
+        user.graceTimer = setTimeout(() => {
+            if (user.status === 'RECONNECTING') {
+                const droppedRole = user.role;
+                const droppedUserId = user.id;
+                const updatedRoom = rooms.get(currentRoomId);
+
+                if (updatedRoom) {
+                    // Remove forfeited player
+                    updatedRoom.users = updatedRoom.users.filter(u => u.id !== user.id);
+
+                    // Promote next active spectator
+                    const nextSpectator = updatedRoom.users.find(u => u.role === 'SPECTATOR' && u.status === 'ACTIVE');
+                    if (nextSpectator) {
+                        nextSpectator.role = droppedRole;
+                    }
+
+                    // Reset game state if running
+                    if (updatedRoom.gameState === 'PLAYING') {
+                        updatedRoom.gameState = 'IDLE';
+                    }
+
+                    // Broadcast queue promotion and full room update
+                    broadcastToRoom(currentRoomId, {
+                        type: 'queue-promoted',
+                        vacatedRole: droppedRole,
+                        forfeitedUserId: droppedUserId,
+                        promotedUser: nextSpectator ? { id: nextSpectator.id, username: nextSpectator.username, role: nextSpectator.role } : null,
+                        userCount: updatedRoom.users.length
+                    });
+
+                    syncRoomStateToAll(currentRoomId);
+                }
+            }
+        }, 15000);
+    });
 });
-// Server start(using 'server.listen' )
+
 server.listen(PORT, () => {
     console.log(`HOMEMADE server running at http://localhost:${PORT}`);
 });
